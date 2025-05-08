@@ -1,2 +1,2 @@
-# SpectralSirens
+# Spectral Sirens
 
