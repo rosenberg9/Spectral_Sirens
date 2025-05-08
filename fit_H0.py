@@ -432,12 +432,12 @@ def objective_evol_comb_m(params, luminosityDistances, log_mass_plus_log1pz, int
     #weighted_residuals = weights * (residuals ** 2)  # Apply weights
 
     # --- Optional prior on Omega_m (Gaussian) ---
-    Om_m_prior_mean = 0.30966     # or your preferred prior mean
-    Om_m_prior_sigma = 0.02   # or your preferred uncertainty
+   # Om_m_prior_mean = 0.30966     # or your preferred prior mean
+   # Om_m_prior_sigma = 0.02   # or your preferred uncertainty
 
-    prior_penalty = ((Om_m - Om_m_prior_mean) ** 2) / (Om_m_prior_sigma ** 2)
+    #prior_penalty = ((Om_m - Om_m_prior_mean) ** 2) / (Om_m_prior_sigma ** 2)
 
-    return np.sum(residuals_low**2) + np.sum(residuals_high**2) + prior_penalty*15
+    return np.sum(residuals_low**2) + np.sum(residuals_high**2)# + prior_penalty*15
 
 def analyze_mass_distance_relation_evol_iter_comb_m(luminosityDistances, log_mass_plus_log1pz, redshift_interpolant,initial_guess=(100, 0, 0,0,0,0.3), d_num=100, width_fac=1.32):
     import numpy as np
