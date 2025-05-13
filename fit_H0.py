@@ -1,8 +1,48 @@
-import numpy as np
-from astropy.cosmology import Planck18
 import bilby as bi
+from astropy.cosmology import Planck18
+import numpy as np
+from astropy import units as u
 
-def analyze_mass_distance_relation_evol_iter_comb(luminosityDistances, log_mass_plus_log1pz, redshift_interpolant, initial_guess=(100, 0, 0,0,0), d_num=100, width_fac=1.32):
+interp_z = None  # Global variable
+
+def create_interpolant(x_min = 40, x_max = 1e8, x_steps = int(1e5)):
+    from astropy.cosmology import Planck18,z_at_value
+    import numpy as np
+    from joblib import Parallel, delayed
+    from scipy.interpolate import interp1d
+    from astropy import units as u
+
+    global interp_z
+    # Define the range of D_L * H0 values to sample
+
+    x_vals = np.linspace(x_min, x_max, x_steps)  # x = D_L * H0
+
+    # Precompute z(x) using H0=1 cosmology
+    def compute_z_from_x(x):
+        try:
+            D_L = x * u.Mpc  # Since we're using H0=1
+            z = z_at_value(Planck18.clone(H0=1).luminosity_distance, D_L)
+            return z.value
+        except Exception as e:
+            print(f"Warning: x={x} — {e}")
+            return np.nan
+
+    z_vals = Parallel(n_jobs=-1, verbose=5)(delayed(compute_z_from_x)(x) for x in x_vals)
+
+    # Step 3: Interpolant: z = f(x = D_L * H0)
+    valid = ~np.isnan(z_vals)
+    interp_z = interp1d(x_vals[valid], np.array(z_vals)[valid], kind='linear', bounds_error=False, fill_value=np.nan)
+
+    return interp_z
+
+
+# Usage function
+def get_z(H0,D_L):
+    if interp_z is None:
+        raise ValueError("You must call create_interpolant() first.")
+    return interp_z(D_L * H0)
+
+def analyze_mass_distance_relation_evol_iter_comb(luminosityDistances, log_mass_plus_log1pz, initial_guess=(100, 0, 0,0,0), d_num=100, width_fac=1.32):
     import numpy as np
     from scipy.stats import gaussian_kde
     from scipy.signal import find_peaks
@@ -124,11 +164,11 @@ def analyze_mass_distance_relation_evol_iter_comb(luminosityDistances, log_mass_
         d_num_high = compute_d_num(len(mass_cut2))
 
     # Perform the fitting
-    fit = fit_and_optimize_evol_comb([lum_dist_cut1, lum_dist_cut2], [mass_cut1,mass_cut2], initial_guess, redshift_interpolant)
+    fit = fit_and_optimize_evol_comb([lum_dist_cut1, lum_dist_cut2], [mass_cut1,mass_cut2], initial_guess)
     
     return fit, (lum_dist_cut1, mass_cut1), (lum_dist_cut2, mass_cut2)
 
-def fit_and_optimize_evol_comb(luminosityDistances, log_mass_plus_log1pz, initial_guess, redshift_interpolant):
+def fit_and_optimize_evol_comb(luminosityDistances, log_mass_plus_log1pz, initial_guess):
 
     """
     Fit for H0, mass offset, and mass evolution slope (k).
@@ -138,7 +178,7 @@ def fit_and_optimize_evol_comb(luminosityDistances, log_mass_plus_log1pz, initia
     result = minimize(
         objective_evol_comb,
         initial_guess,  # Initial guess for [H0, mass_offset, k]
-        args=(luminosityDistances, log_mass_plus_log1pz, redshift_interpolant),
+        args=(luminosityDistances, log_mass_plus_log1pz),
         bounds=[(40, 100), (5, 100), (-0.3, 1.4),(5, 100), (-1.4, 1.4)],  # Add bounds for k if needed
         method="L-BFGS-B"
     )
@@ -149,7 +189,7 @@ def fit_and_optimize_evol_comb(luminosityDistances, log_mass_plus_log1pz, initia
         best_H0, best_mass_offset_low, best_k_low,best_mass_offset_high, best_k_high = None, None, None, None, None
     return best_H0, best_mass_offset_low, best_k_low,best_mass_offset_high, best_k_high
 
-def objective_evol_comb(params, luminosityDistances, log_mass_plus_log1pz, interpolant):
+def objective_evol_comb(params, luminosityDistances, log_mass_plus_log1pz):
     """
     Objective function to fit H0, mass offset, and mass evolution slope k, with weights.
     """
@@ -162,17 +202,22 @@ def objective_evol_comb(params, luminosityDistances, log_mass_plus_log1pz, inter
     mass_cut2 = log_mass_plus_log1pz[1]
 
     # Prepare the input for the interpolant
-    points_low = np.vstack((np.full_like(lum_dist_cut1.value, H0), lum_dist_cut1.value)).T  # Shape (N, 2)
+    #points_low = np.vstack((np.full_like(lum_dist_cut1.value, H0), lum_dist_cut1.value)).T  # Shape (N, 2)
 
     # Get interpolated redshifts
-    redshifts_low = interpolant(points_low)
+    #redshifts_low = interpolant(points_low)
 
     # Prepare the input for the interpolant
-    points_high = np.vstack((np.full_like(lum_dist_cut2.value, H0), lum_dist_cut2.value)).T  # Shape (N, 2)
+    #points_high = np.vstack((np.full_like(lum_dist_cut2.value, H0), lum_dist_cut2.value)).T  # Shape (N, 2)
 
     # Get interpolated redshifts
-    redshifts_high = interpolant(points_high)
-    
+    #redshifts_high = interpolant(points_high)
+
+    redshifts_low = get_z(np.full_like(lum_dist_cut1.value, H0),lum_dist_cut1.value)
+
+
+    redshifts_high = get_z(np.full_like(lum_dist_cut2.value, H0),lum_dist_cut2.value)
+
     # Handle NaNs (optional): Assign a high residual if any z is NaN
     if np.isnan(redshifts_low).any() or np.isnan(redshifts_high).any():
         return np.inf  # Penalize invalid z values
@@ -246,7 +291,7 @@ def inverseTransformSamplingWithEvolution(cdf_list, m_1, redshifts, num_samples)
         samples.append(inverse_samples)
     return np.concatenate(samples) * u.Msun
 
-def fit_and_plot_evol(H0, mass_offset,k, luminosityDistances, log_mass_plus_log1pz,interpolant, label_suffix, color_obs, color_fit):
+def fit_and_plot_evol(H0, mass_offset,k, luminosityDistances, log_mass_plus_log1pz, label_suffix, color_obs, color_fit):
     import numpy as np
     import matplotlib.pyplot as plt
     
@@ -262,10 +307,13 @@ def fit_and_plot_evol(H0, mass_offset,k, luminosityDistances, log_mass_plus_log1
 
 
     # Prepare the input for the interpolant
-    points = np.vstack((np.full_like(distance_samples, H0), distance_samples)).T  # Shape (N, 2)
+    #points = np.vstack((np.full_like(distance_samples, H0), distance_samples)).T  # Shape (N, 2)
     
     # Get interpolated redshifts
-    redshifts = interpolant(points)
+    #redshifts = interpolant(points)
+
+    redshifts = get_z(np.full_like(distance_samples, H0),distance_samples)
+
 
 
     modeled_values = []
@@ -403,6 +451,7 @@ def objective_evol_comb_m(params, luminosityDistances, log_mass_plus_log1pz, int
 
     # Get interpolated redshifts
     redshifts_low = interpolant(points_low)
+    
 
     # Prepare the input for the interpolant
     points_high = np.vstack((
