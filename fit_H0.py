@@ -2,45 +2,156 @@ import bilby as bi
 from astropy.cosmology import Planck18
 import numpy as np
 from astropy import units as u
+from scipy.interpolate import RegularGridInterpolator, interp1d
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
-interp_z = None  # Global variable
+# Global variable to store the final interpolant
+_z_interp = None
+_z_interp_m = None
 
-def create_interpolant(x_min = 40, x_max = 1e8, x_steps = int(1e5)):
-    from astropy.cosmology import Planck18,z_at_value
-    import numpy as np
-    from joblib import Parallel, delayed
-    from scipy.interpolate import interp1d
-    from astropy import units as u
+def create_interpolant(zmin=1e-4, zmax=1e2, nz=5000,
+                       H0min=0.1, H0max=200, nH0=300,
+                       ndl=5000):
+    """
+    Precomputes the interpolant (H0, DL) -> z.
+    This function must be called once before using get_z().
+    """
+    global _z_interp
 
-    global interp_z
-    # Define the range of D_L * H0 values to sample
+    print("Creating redshift and H0 grids...")
+    z_grid_vals = np.logspace(np.log10(zmin), np.log10(zmax), nz)
+    H0_grid_vals = np.linspace(H0min, H0max, nH0)
 
-    x_vals = np.linspace(x_min, x_max, x_steps)  # x = D_L * H0
+    print("Computing DL(H0, z) grid...")
+    def compute_DL_row(i):
+        H0 = H0_grid_vals[i]
+        cosmo = Planck18.clone(H0=H0)
+        return cosmo.luminosity_distance(z_grid_vals).to_value(u.Mpc)
 
-    # Precompute z(x) using H0=1 cosmology
-    def compute_z_from_x(x):
+    DL_rows = Parallel(n_jobs=-1)(
+        delayed(compute_DL_row)(i) for i in tqdm(range(len(H0_grid_vals)), desc="Stage 1: DL(H0, z)")
+    )
+    DL_grid = np.array(DL_rows)
+
+    print("Defining DL grid for inversion...")
+    dl_min = max(1.0, np.nanmin(DL_grid))
+    dl_max = np.nanmax(DL_grid)
+    dl_grid_vals = np.logspace(np.log10(dl_min), np.log10(dl_max), ndl)
+
+    print("Inverting DL(H0, z) -> z(H0, DL)...")
+    def invert_DL_for_H0(i):
+        DL_row = DL_grid[i]
+        valid = np.isfinite(DL_row) & (np.diff(DL_row, prepend=0) > 0)
+        DL_clean = DL_row[valid]
+        z_clean = z_grid_vals[valid]
+        if len(DL_clean) < 2:
+            return np.full_like(dl_grid_vals, np.nan)
+        inv_interp = interp1d(DL_clean, z_clean, bounds_error=False,
+                              fill_value=(z_clean[0], z_clean[-1]))
+        return inv_interp(dl_grid_vals)
+
+    Z_rows = Parallel(n_jobs=-1)(
+        delayed(invert_DL_for_H0)(i) for i in tqdm(range(len(H0_grid_vals)), desc="Stage 2: z(H0, DL)")
+    )
+    Z_grid = np.array(Z_rows)
+
+    print("Creating final interpolant...")
+    _z_interp = RegularGridInterpolator(
+        (H0_grid_vals, dl_grid_vals), Z_grid,
+        bounds_error=False, fill_value=None
+    )
+
+    print("Interpolant created successfully.")
+
+
+def get_z(H0, D_L):
+    """
+    Returns the redshift z corresponding to input H0 and luminosity distance D_L (in Mpc).
+    Requires that create_interpolant() has been called first.
+    """
+    global _z_interp
+    if _z_interp is None:
+        raise RuntimeError("You must call create_interpolant() before using get_z().")
+
+    H0 = np.atleast_1d(H0)
+    D_L = np.atleast_1d(D_L)
+    points = np.column_stack((H0, D_L))
+    return _z_interp(points)
+
+
+def create_interpolant_m(zmin=1e-4, zmax=1e2, nz=5000,
+                         H0min=0.1, H0max=200, nH0=1000,
+                         Om_mmin=0.2, Om_mmax=0.4, nOm_m=1000,
+                         ndl=1000):
+    """
+    Precomputes the interpolant (H0, Om_m, DL) -> z.
+    This function must be called once before using get_z().
+    """
+    global _z_interp_m
+
+    print("Creating redshift, H0, and Om_m grids...")
+    z_grid_vals = np.logspace(np.log10(zmin), np.log10(zmax), nz)
+    H0_grid_vals = np.linspace(H0min, H0max, nH0)
+    Om_m_vals = np.linspace(Om_mmin, Om_mmax, nOm_m)
+
+    # Preallocate full DL grid: shape (nH0, nOm_m, nz)
+    DL_grid = np.empty((nH0, nOm_m, nz))
+
+    print("Computing DL(H0, Om_m, z) grid...")
+    def compute_DL(H_idx, Om_idx):
+        H0 = H0_grid_vals[H_idx]
+        Om0 = Om_m_vals[Om_idx]
+        cosmo = Planck18.clone(H0=H0, Om0=Om0)
         try:
-            D_L = x * u.Mpc  # Since we're using H0=1
-            z = z_at_value(Planck18.clone(H0=1).luminosity_distance, D_L)
-            return z.value
-        except Exception as e:
-            print(f"Warning: x={x} — {e}")
-            return np.nan
+            DL_vals = cosmo.luminosity_distance(z_grid_vals).to_value(u.Mpc)
+        except Exception:
+            DL_vals = np.full_like(z_grid_vals, np.nan)
+        return (H_idx, Om_idx, DL_vals)
 
-    z_vals = Parallel(n_jobs=-1, verbose=5)(delayed(compute_z_from_x)(x) for x in x_vals)
+    results = Parallel(n_jobs=-1)(
+        delayed(compute_DL)(i, j)
+        for i in tqdm(range(nH0), desc="H0 loop")
+        for j in range(nOm_m)
+    )
 
-    # Step 3: Interpolant: z = f(x = D_L * H0)
-    valid = ~np.isnan(z_vals)
-    interp_z = interp1d(x_vals[valid], np.array(z_vals)[valid], kind='linear', bounds_error=False, fill_value=np.nan)
+    for i, j, row in results:
+        DL_grid[i, j, :] = row
 
-    return interp_z
+    print("Defining DL grid for inversion...")
+    dl_min = max(1.0, np.nanmin(DL_grid))
+    dl_max = np.nanmax(DL_grid)
+    dl_grid_vals = np.logspace(np.log10(dl_min), np.log10(dl_max), ndl)
 
+    print("Inverting DL(H0, Om_m, z) -> z(H0, Om_m, DL)...")
+    def invert_DL(H_idx, Om_idx):
+        DL_row = DL_grid[H_idx, Om_idx, :]
+        valid = np.isfinite(DL_row) & (np.diff(DL_row, prepend=0) > 0)
+        DL_clean = DL_row[valid]
+        z_clean = z_grid_vals[valid]
+        if len(DL_clean) < 2:
+            return np.full_like(dl_grid_vals, np.nan)
+        inv_interp = interp1d(DL_clean, z_clean, bounds_error=False,
+                              fill_value=(z_clean[0], z_clean[-1]))
+        return (H_idx, Om_idx, inv_interp(dl_grid_vals))
 
-# Usage function
-def get_z(H0,D_L):
-    if interp_z is None:
-        raise ValueError("You must call create_interpolant() first.")
-    return interp_z(D_L * H0)
+    Z_grid = np.empty((nH0, nOm_m, ndl))
+    inv_results = Parallel(n_jobs=-1)(
+        delayed(invert_DL)(i, j)
+        for i in tqdm(range(nH0), desc="Inversion H0 loop")
+        for j in range(nOm_m)
+    )
+
+    for i, j, z_row in inv_results:
+        Z_grid[i, j, :] = z_row
+
+    print("Creating final interpolant...")
+    _z_interp_m = RegularGridInterpolator(
+        (H0_grid_vals, Om_m_vals, dl_grid_vals), Z_grid,
+        bounds_error=False, fill_value=None
+    )
+
+    print("3D interpolant (H0, Om_m, DL) -> z created successfully.")
 
 def analyze_mass_distance_relation_evol_iter_comb(luminosityDistances, log_mass_plus_log1pz, initial_guess=(100, 0, 0,0,0), d_num=100, width_fac=1.32):
     import numpy as np
@@ -234,7 +345,6 @@ def objective_evol_comb(params, luminosityDistances, log_mass_plus_log1pz):
     #weighted_residuals = weights * (residuals ** 2)  # Apply weights
     resid_tot = np.sum(residuals_low**2)+np.sum(residuals_high**2)
 
-    print(resid_tot)
     return resid_tot  # Sum of squared residuals
 
 def massDensity_evol(mu_1_base, sigma_1, f_p1, alpha_1, m_min, m_b, 
