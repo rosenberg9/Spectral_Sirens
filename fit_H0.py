@@ -219,8 +219,8 @@ def objective_evol_comb(params, luminosityDistances, log_mass_plus_log1pz):
     redshifts_high = get_z(np.full_like(lum_dist_cut2.value, H0),lum_dist_cut2.value)
 
     # Handle NaNs (optional): Assign a high residual if any z is NaN
-    if np.isnan(redshifts_low).any() or np.isnan(redshifts_high).any():
-        return np.inf  # Penalize invalid z values
+    #if np.isnan(redshifts_low).any() or np.isnan(redshifts_high).any():
+     #   return np.inf  # Penalize invalid z values
 
     # Compute the modeled log(1+z) + mass_offset with evolving mass peak
     modeled_log1pz_plus_logM_low = np.log10(mass_offset_low + k_low * redshifts_low) + np.log10(1 + redshifts_low)
@@ -232,8 +232,10 @@ def objective_evol_comb(params, luminosityDistances, log_mass_plus_log1pz):
     residuals_high = mass_cut2 - modeled_log1pz_plus_logM_high
 
     #weighted_residuals = weights * (residuals ** 2)  # Apply weights
+    resid_tot = np.sum(residuals_low**2)+np.sum(residuals_high**2)
 
-    return np.sum(residuals_low**2)+np.sum(residuals_high**2)  # Sum of squared residuals
+    print(resid_tot)
+    return resid_tot  # Sum of squared residuals
 
 def massDensity_evol(mu_1_base, sigma_1, f_p1, alpha_1, m_min, m_b, 
                      mu_2_base, sigma_2, f_p2, alpha_2, delta_m, m_max, redshifts, ev_1, ev_2):
